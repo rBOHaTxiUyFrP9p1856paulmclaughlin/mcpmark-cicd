@@ -1,0 +1,334 @@
+name: Issue Management Automation
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  issue-triage:
+    if: ${{ github.event.issue != null }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure labels exist and triage issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const octokit = github;
+            const { owner, repo } = context.repo;
+            const issueNumber = context.payload.issue.number;
+            const issue = context.payload.issue;
+
+            async function ensureLabel(name, color, description) {
+              try {
+                await octokit.rest.issues.getLabel({ owner, repo, name });
+              } catch (e) {
+                if (e.status === 404) {
+                  try {
+                    await octokit.rest.issues.createLabel({ owner, repo, name, color, description });
+                  } catch (createErr) {
+                    core.warning(`Failed to create label ${name}: ${createErr.message}`);
+                  }
+                } else {
+                  core.warning(`Failed to get label ${name}: ${e.message}`);
+                }
+              }
+            }
+
+            const labelsToEnsure = [
+              { name: 'bug', color: 'd73a4a', description: "Something isn't working" },
+              { name: 'enhancement', color: 'a2eeef', description: 'New feature or request' },
+              { name: 'epic', color: '5319e7', description: 'Large feature requiring multiple sub-tasks' },
+              { name: 'maintenance', color: '0366d6', description: 'Maintenance and housekeeping tasks' },
+              { name: 'priority-critical', color: 'b60205', description: 'Critical priority issue' },
+              { name: 'priority-high', color: 'd93f0b', description: 'High priority issue' },
+              { name: 'priority-medium', color: 'fbca04', description: 'Medium priority issue' },
+              { name: 'priority-low', color: '0e8a16', description: 'Low priority issue' },
+              { name: 'needs-triage', color: 'ededed', description: 'Needs to be reviewed by maintainers' },
+              { name: 'needs-review', color: 'c2e0c6', description: 'Awaiting review from maintainers' },
+              { name: 'first-time-contributor', color: '5319e7', description: 'Issue created by first-time contributor' }
+            ];
+
+            for (const l of labelsToEnsure) {
+              await ensureLabel(l.name, l.color, l.description);
+            }
+
+            // Always add needs-triage label
+            try {
+              await octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: ['needs-triage'] });
+            } catch (e) {
+              core.warning(`Failed to add needs-triage label: ${e.message}`);
+            }
+
+            const title = (issue.title || '').toLowerCase();
+            const bodyText = (issue.body || '').toLowerCase();
+            const text = `${title}\n${bodyText}`;
+
+            // Category labels based on title (case-insensitive)
+            const categoryLabels = [];
+            if (title.includes('bug')) categoryLabels.push('bug');
+            if (title.includes('epic')) categoryLabels.push('epic');
+            if (title.includes('maintenance')) categoryLabels.push('maintenance');
+
+            if (categoryLabels.length > 0) {
+              try {
+                await octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: categoryLabels });
+              } catch (e) {
+                core.warning(`Failed to add category labels: ${e.message}`);
+              }
+            }
+
+            // Priority detection across title and body (highest wins)
+            const priorities = [
+              { name: 'priority-critical', keywords: ['critical', 'urgent', 'production', 'outage'], rank: 4 },
+              { name: 'priority-high', keywords: ['important', 'high', 'blocking'], rank: 3 },
+              { name: 'priority-medium', keywords: ['medium', 'normal'], rank: 2 },
+              { name: 'priority-low', keywords: ['low', 'nice-to-have', 'minor'], rank: 1 },
+            ];
+            let chosenPriority = null;
+            let chosenRank = -1;
+            for (const p of priorities) {
+              if (p.keywords.some(k => text.includes(k))) {
+                if (p.rank > chosenRank) {
+                  chosenPriority = p.name;
+                  chosenRank = p.rank;
+                }
+              }
+            }
+            if (!chosenPriority) {
+              chosenPriority = 'priority-medium';
+            }
+
+            // Remove conflicting priority labels (optional cleanup)
+            try {
+              // Fetch current labels to be accurate
+              const currentLabelsResp = await octokit.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: issueNumber });
+              const existing = (currentLabelsResp.data || []).map(l => l.name);
+              const priorityLabels = priorities.map(p => p.name);
+              const toRemove = existing.filter(l => priorityLabels.includes(l) && l !== chosenPriority);
+              for (const l of toRemove) {
+                try {
+                  await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name: l });
+                } catch (err) {
+                  core.info(`Couldn't remove label ${l}: ${err.message}`);
+                }
+              }
+            } catch (e) {
+              core.info(`Couldn't reconcile existing priority labels: ${e.message}`);
+            }
+
+            try {
+              await octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: [chosenPriority] });
+            } catch (e) {
+              core.warning(`Failed to add priority label: ${e.message}`);
+            }
+
+            core.info(`Triaged issue #${issueNumber} with labels: ${[...categoryLabels, chosenPriority, 'needs-triage'].join(', ')}`);
+
+  task-breakdown:
+    needs: issue-triage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create sub-issues for Epic
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const octokit = github;
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+            const title = (issue.title || '');
+
+            if (!title.toLowerCase().includes('epic')) {
+              core.info(`Issue #${issueNumber} is not an Epic. Skipping sub-issue creation.`);
+              return;
+            }
+
+            // Guard against duplicate sub-issue creation by checking parent body
+            let parentBody = issue.body || '';
+            if (!parentBody) {
+              try {
+                const parent = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
+                parentBody = parent.data.body || '';
+              } catch (e) {
+                core.info(`Failed to fetch parent body: ${e.message}`);
+              }
+            }
+            const alreadyHasChecklist = parentBody.includes('## Epic Tasks');
+            if (alreadyHasChecklist) {
+              core.info(`Epic checklist already present for #${issueNumber}. Skipping sub-issue creation.`);
+              return;
+            }
+
+            const taskNames = [
+              'Requirements Analysis',
+              'Design and Architecture',
+              'Implementation',
+              'Testing and Documentation'
+            ];
+            const created = [];
+            for (let i = 0; i < taskNames.length; i++) {
+              const taskTitle = `[SUBTASK] ${title} - Task ${i + 1}: ${taskNames[i]}`;
+              const body = `Related to #${issueNumber}\n\nPlease complete: ${taskNames[i]}.`;
+              try {
+                const res = await octokit.rest.issues.create({
+                  owner, repo,
+                  title: taskTitle,
+                  body,
+                  labels: ['enhancement', 'needs-review']
+                });
+                created.push(res.data.number);
+              } catch (e) {
+                core.warning(`Failed to create sub-issue ${i + 1}: ${e.message}`);
+              }
+            }
+
+            if (created.length !== taskNames.length) {
+              core.warning(`Expected to create ${taskNames.length} sub-issues, but created ${created.length}.`);
+            }
+
+            // Update parent issue body with checklist linking sub-issues
+            try {
+              const parent = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
+              const prevBody = parent.data.body || '';
+              const checklistLines = created.map((n, idx) => `- [ ] Task ${idx + 1}: ${taskNames[idx]} (See #${n})`).join('\n');
+              const checklist = `## Epic Tasks\n${checklistLines}`;
+              const newBody = prevBody ? `${prevBody}\n\n${checklist}` : checklist;
+              await octokit.rest.issues.update({ owner, repo, issue_number: issueNumber, body: newBody });
+            } catch (e) {
+              core.warning(`Failed to update parent issue body: ${e.message}`);
+            }
+
+            core.info(`Created sub-issues for Epic #${issueNumber}: ${created.join(', ')}`);
+
+  auto-response:
+    needs: issue-triage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure milestone and set for high/critical priority
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const octokit = github;
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+
+            // Ensure milestone v1.0.0 exists
+            let milestoneNumber = null;
+            try {
+              const ms = await octokit.rest.issues.listMilestones({ owner, repo, state: 'open' });
+              const target = ms.data.find(m => m.title === 'v1.0.0');
+              if (target) {
+                milestoneNumber = target.number;
+              } else {
+                const created = await octokit.rest.issues.createMilestone({ owner, repo, title: 'v1.0.0' });
+                milestoneNumber = created.data.number;
+              }
+            } catch (e) {
+              core.warning(`Milestone setup failed: ${e.message}`);
+            }
+
+            // Fetch current labels on the issue to avoid relying on event payload
+            let currentLabelNames = [];
+            try {
+              const currentLabelsResp = await octokit.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: issueNumber });
+              currentLabelNames = (currentLabelsResp.data || []).map(l => l.name);
+            } catch (e) {
+              core.info(`Couldn't fetch current labels: ${e.message}`);
+            }
+
+            // If priority-high or priority-critical, set milestone
+            try {
+              if (milestoneNumber && (currentLabelNames.includes('priority-high') || currentLabelNames.includes('priority-critical'))) {
+                await octokit.rest.issues.update({ owner, repo, issue_number: issueNumber, milestone: milestoneNumber });
+              }
+            } catch (e) {
+              core.warning(`Failed to set milestone: ${e.message}`);
+            }
+
+      - name: Welcome and respond to issue type (first-time check only on opened)
+        if: ${{ github.event.action == 'opened' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const octokit = github;
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+            const author = issue.user.login;
+
+            // Determine if this is author's first issue in this repo
+            let isFirst = false;
+            try {
+              const q = `repo:${owner}/${repo} type:issue author:${author}`;
+              const res = await octokit.rest.search.issuesAndPullRequests({ q, per_page: 2 });
+              const count = res.data.total_count;
+              isFirst = count <= 1; // includes current issue
+            } catch (e) {
+              core.warning(`Failed to determine first-time status: ${e.message}`);
+            }
+
+            // Derive response type from the title to avoid relying on labels in the event payload
+            const lowerTitle = (issue.title || '').toLowerCase();
+            let responseType = 'general';
+            if (lowerTitle.includes('bug')) responseType = 'bug';
+            else if (lowerTitle.includes('epic')) responseType = 'epic';
+            else if (lowerTitle.includes('maintenance')) responseType = 'maintenance';
+
+            let message = '';
+            if (responseType === 'bug') {
+              message = [
+                `Thanks for reporting this!`,
+                `Bug Report Guidelines: Please include detailed reproduction steps, expected vs actual behavior, logs, and environment info.`,
+                `Our team will review and prioritize this issue.`
+              ].join('\n\n');
+            } else if (responseType === 'epic') {
+              message = [
+                `Thanks for the detailed feature concept!`,
+                `Feature Request Process: We'll break this down into subtasks, discuss scope, and plan milestones.`,
+                `Stay tuned for the task checklist and reviews.`
+              ].join('\n\n');
+            } else if (responseType === 'maintenance') {
+              message = [
+                `Thanks for improving the project!`,
+                `Maintenance Guidelines: Please outline the cleanup/refactor scope, risks, and testing plan.`,
+                `We'll review and incorporate the changes accordingly.`
+              ].join('\n\n');
+            } else {
+              message = [
+                `Thanks for opening this issue!`,
+                `We'll review and respond shortly.`
+              ].join('\n\n');
+            }
+
+            if (isFirst) {
+              try {
+                await octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: ['first-time-contributor'] });
+              } catch (e) {
+                core.warning(`Failed to add first-time-contributor label: ${e.message}`);
+              }
+              message = `Welcome to the repository, @${author}! 🎉\n\n` + message;
+            }
+
+            // Post the comment
+            try {
+              await octokit.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body: message });
+            } catch (e) {
+              core.warning(`Failed to post auto-response comment: ${e.message}`);
+            }
+
+            // Change status from needs-triage to needs-review
+            try {
+              await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name: 'needs-triage' });
+            } catch (e) {
+              core.info(`Couldn't remove needs-triage: ${e.message}`);
+            }
+            try {
+              await octokit.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels: ['needs-review'] });
+            } catch (e) {
+              core.warning(`Failed to add needs-review: ${e.message}`);
+            }
