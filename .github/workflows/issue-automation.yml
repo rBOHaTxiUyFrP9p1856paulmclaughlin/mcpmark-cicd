@@ -1,5 +1,10 @@
 name: Issue Management Automation
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
 on:
   issues:
     types: [opened, labeled]
@@ -101,7 +106,6 @@ jobs:
 
             // Remove conflicting priority labels (optional cleanup)
             try {
-              // Fetch current labels to be accurate
               const currentLabelsResp = await octokit.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: issueNumber });
               const existing = (currentLabelsResp.data || []).map(l => l.name);
               const priorityLabels = priorities.map(p => p.name);
@@ -145,7 +149,6 @@ jobs:
               return;
             }
 
-            // Guard against duplicate sub-issue creation by checking parent body
             let parentBody = issue.body || '';
             if (!parentBody) {
               try {
@@ -188,7 +191,6 @@ jobs:
               core.warning(`Expected to create ${taskNames.length} sub-issues, but created ${created.length}.`);
             }
 
-            // Update parent issue body with checklist linking sub-issues
             try {
               const parent = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
               const prevBody = parent.data.body || '';
@@ -216,7 +218,6 @@ jobs:
             const issue = context.payload.issue;
             const issueNumber = issue.number;
 
-            // Ensure milestone v1.0.0 exists
             let milestoneNumber = null;
             try {
               const ms = await octokit.rest.issues.listMilestones({ owner, repo, state: 'open' });
@@ -231,7 +232,6 @@ jobs:
               core.warning(`Milestone setup failed: ${e.message}`);
             }
 
-            // Fetch current labels on the issue to avoid relying on event payload
             let currentLabelNames = [];
             try {
               const currentLabelsResp = await octokit.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: issueNumber });
@@ -240,7 +240,6 @@ jobs:
               core.info(`Couldn't fetch current labels: ${e.message}`);
             }
 
-            // If priority-high or priority-critical, set milestone
             try {
               if (milestoneNumber && (currentLabelNames.includes('priority-high') || currentLabelNames.includes('priority-critical'))) {
                 await octokit.rest.issues.update({ owner, repo, issue_number: issueNumber, milestone: milestoneNumber });
@@ -261,18 +260,16 @@ jobs:
             const issueNumber = issue.number;
             const author = issue.user.login;
 
-            // Determine if this is author's first issue in this repo
             let isFirst = false;
             try {
               const q = `repo:${owner}/${repo} type:issue author:${author}`;
               const res = await octokit.rest.search.issuesAndPullRequests({ q, per_page: 2 });
               const count = res.data.total_count;
-              isFirst = count <= 1; // includes current issue
+              isFirst = count <= 1;
             } catch (e) {
               core.warning(`Failed to determine first-time status: ${e.message}`);
             }
 
-            // Derive response type from the title to avoid relying on labels in the event payload
             const lowerTitle = (issue.title || '').toLowerCase();
             let responseType = 'general';
             if (lowerTitle.includes('bug')) responseType = 'bug';
@@ -314,14 +311,12 @@ jobs:
               message = `Welcome to the repository, @${author}! 🎉\n\n` + message;
             }
 
-            // Post the comment
             try {
               await octokit.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body: message });
             } catch (e) {
               core.warning(`Failed to post auto-response comment: ${e.message}`);
             }
 
-            // Change status from needs-triage to needs-review
             try {
               await octokit.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name: 'needs-triage' });
             } catch (e) {
