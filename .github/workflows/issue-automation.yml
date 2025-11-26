@@ -101,7 +101,9 @@ jobs:
 
             // Remove conflicting priority labels (optional cleanup)
             try {
-              const existing = (issue.labels || []).map(l => l.name);
+              // Fetch current labels to be accurate
+              const currentLabelsResp = await octokit.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: issueNumber });
+              const existing = (currentLabelsResp.data || []).map(l => l.name);
               const priorityLabels = priorities.map(p => p.name);
               const toRemove = existing.filter(l => priorityLabels.includes(l) && l !== chosenPriority);
               for (const l of toRemove) {
@@ -229,10 +231,18 @@ jobs:
               core.warning(`Milestone setup failed: ${e.message}`);
             }
 
+            // Fetch current labels on the issue to avoid relying on event payload
+            let currentLabelNames = [];
+            try {
+              const currentLabelsResp = await octokit.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: issueNumber });
+              currentLabelNames = (currentLabelsResp.data || []).map(l => l.name);
+            } catch (e) {
+              core.info(`Couldn't fetch current labels: ${e.message}`);
+            }
+
             // If priority-high or priority-critical, set milestone
             try {
-              const labels = (issue.labels || []).map(l => l.name);
-              if (milestoneNumber && (labels.includes('priority-high') || labels.includes('priority-critical'))) {
+              if (milestoneNumber && (currentLabelNames.includes('priority-high') || currentLabelNames.includes('priority-critical'))) {
                 await octokit.rest.issues.update({ owner, repo, issue_number: issueNumber, milestone: milestoneNumber });
               }
             } catch (e) {
@@ -262,11 +272,12 @@ jobs:
               core.warning(`Failed to determine first-time status: ${e.message}`);
             }
 
-            const labels = (issue.labels || []).map(l => l.name);
+            // Derive response type from the title to avoid relying on labels in the event payload
+            const lowerTitle = (issue.title || '').toLowerCase();
             let responseType = 'general';
-            if (labels.includes('bug')) responseType = 'bug';
-            else if (labels.includes('epic')) responseType = 'epic';
-            else if (labels.includes('maintenance')) responseType = 'maintenance';
+            if (lowerTitle.includes('bug')) responseType = 'bug';
+            else if (lowerTitle.includes('epic')) responseType = 'epic';
+            else if (lowerTitle.includes('maintenance')) responseType = 'maintenance';
 
             let message = '';
             if (responseType === 'bug') {
